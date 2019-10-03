@@ -1,0 +1,561 @@
+# Florian Blanc 10 aout 2017
+# Master script to implement Hummer's variant of the CVSM (PNAS 2010)
+# Arbitrary number of CVs supported
+
+replicaBarrier
+set replica_id [myReplica]
+set num_replicas [numReplicas]
+
+source $namd_config_file
+
+
+OutputEnergies  $freq
+OutputPressure  $freq
+OutputTiming    $freq
+XstFreq         $freq
+
+Langevin on 
+LangevinDamping $Ldamping
+LangevinTemp    $temperature
+
+UseGroupPressure                  yes
+berendsenpressure                 on
+berendsenpressuretarget           $pressure
+berendsenpressurecompressibility  $compressibility # compressibility of acetonitrile
+berendsenpressurerelaxationtime   400
+BerendsenPressureFreq             2
+
+
+bincoordinates [ format $bincoor_file $replica_id ]
+
+if { [ info exists binvel_file ] } {
+    
+    
+    binvelocities [ format $binvel_file $replica_id ]
+    
+} else {
+    temperature    $temperature
+}
+
+if { [ info exists xsc_file ] } { 
+    
+    extendedsystem  [ format $xsc_file $replica_id ]
+
+} else {
+
+    cellBasisVector1   72.    0.    0.
+    cellBasisVector2    0.   60.    0.
+    cellBasisVector3    0.    0.   60.
+    cellOrigin          0.    0.    0.
+}
+
+
+if { $run_mode == "prod" } {
+    # Long range electrostatics
+    pme             yes
+    pmegridsizex     72
+    pmegridsizey     60
+    pmegridsizez     60
+    fullelectfrequency 2
+    PMEInterpOrder  6
+    PMEPencils      13
+
+} elseif { $run_mode == "test" } {
+    pme no
+}
+
+
+set t 0
+
+set job_output_root [ format $output_root $replica_id $t ]
+outputname      $job_output_root
+restartname     $job_output_root-rst
+restartfreq     $freq
+
+
+
+
+
+colvars on
+
+proc read_string { string_file replica_id } {
+    
+    set f [ open $string_file ] 
+    
+    set ii 0 
+    
+    while { [ gets $f line ] >= 0 } {
+        
+        if { $ii == $replica_id } {
+            break
+        } else {
+            incr ii
+        }
+    }
+    
+    return $line
+}
+
+proc read_cv_template { cv_file } {
+    
+    set f [ open $cv_file ] 
+    
+    set a [ read $f ]
+    
+    return $a
+}
+    
+
+
+# HERE INITIALIZE THE CVs 
+
+# first pass output parameters
+set config1 "
+ColvarsTrajFrequency %04d
+ColvarsRestartFrequency %05d
+"
+
+# then declare all the Cvs (string and others) + non-string biases 
+# (here to keep orientation and position of the molecule)
+
+set config1 [ format $config1 $freq $freq ]
+cv config $config1
+
+set config2 [ read_cv_template $cv_template ]
+cv config $config2
+
+
+# Read list of CVs for the string
+set cv_names_tmp [ cv list ]
+set cv_names [ list ]
+
+foreach cv_name $cv_names_tmp {
+    
+    if {[regexp {^string_} $cv_name]} {
+        set cv_names [ lappend cv_names $cv_name ]
+    }
+}
+
+set n_cv [ llength $cv_names ]
+
+print "STRING METHOD: DETECTED $n_cv SPANNING COLLECTIVE VARIABLES"
+
+# We gonna need a cv_indexes list with the indexes; eg for 2 cvs the list 
+# is [ list 0 1 ]
+
+set cv_indexes [ list ]
+
+for { set i 0 } { $i < $n_cv } { incr i } { 
+    
+    set cv_indexes [ lappend cv_indexes $i ]
+}
+
+
+
+
+# initialize the harmonic restraint to the reference path: 
+
+
+
+set string_centers [ read_string $ref_string_file $replica_id ]
+print "STRING METHOD: read input string image:"
+print "STRING METHOD: $string_centers"
+set string_centers [ split $string_centers "  "]
+
+set center_list [ list ]
+for { set j 1 } { $j < [ llength $string_centers ] } { incr j } {
+    
+    # When we split the string_centers string, the white spaces remain
+    # so we need to skip them
+    # 
+        
+    # Put everything in %08.4f format to avoid reading bugs
+    set foo [ lindex $string_centers $j ]
+    #print $foo
+    set center_list [ lappend center_list [ format "%08.4f" $foo ] ]
+    #~ print [ lindex $center_list $j ]
+    
+}
+
+# Now set up the bias
+set config3 "harmonic {
+    name string_bias
+    colvars $cv_names
+    forceConstant $force_constant
+    centers $center_list
+    
+}
+"
+
+
+# Auxiliary variable for string reparametrization
+
+set d_alpha_eq [expr {double($num_images) - 1.0}]
+set d_alpha_eq [ expr 1.0/$d_alpha_eq ]
+
+# Normalized arc-length for the equally spaced string (just linspace(0,1,M))
+
+set normalized_arc_length_eq [ list 0.0 ] 
+set sum 0.0
+for { set i 1 } { $i < $num_images } { incr i } {
+    set sum [ expr {$sum + $d_alpha_eq} ]
+    set normalized_arc_length_eq [ lappend normalized_arc_length_eq $sum ]
+}
+
+
+#################################
+# SUBROUTINES FOR STRING UPDATE #
+#################################
+
+        
+
+proc smooth_string { drifts } {
+    global num_images smooth_param cv_indexes
+    upvar $drifts smoothed
+    
+    # Create local copy of the initial array
+    # for future need 
+    
+    print "STRING METHOD: SMOOTHING"
+    
+    foreach key [ array names smoothed ] {
+        set drifts_array($key) $smoothed($key)
+    }
+    
+    # This procedure realizes an in-place modification of the string
+    
+    # First point is left unchanged by smoothing
+    # set smoothed(0) $drifts_array(0)
+    
+
+    for { set i 1 } { $i < [ expr $num_images - 1 ] } { incr i } {
+        
+        # Here i goes from 1 to $num_replicas - 2 so it avoids the 
+        # boundaries
+        
+        
+        # Consequently, left_image and right_image are well defined even
+        # for boundary values ( i =1 --> left_image has index 0, i=n-2, --> right_image has index n-1)
+        set left_image  $drifts_array([ expr $i - 1 ])
+        set right_image $drifts_array([ expr $i + 1 ])
+        
+        set smooth [list]
+        # loop over CVs 
+		foreach j $cv_indexes {
+
+            #print $j
+            
+            set smooth_j1_left  [ lindex $left_image $j ] 
+            set smooth_j1_right [ lindex $right_image $j ] 
+            set smooth_j1 [ expr {$smooth_j1_left + $smooth_j1_right} ] 
+            set smooth_j1 [ expr {0.5*$smooth_param*$smooth_j1} ]
+            
+            set smooth_j2 [ expr 1.0 - $smooth_param ]
+            set smooth_j2 [ expr $smooth_j2*[ lindex $drifts_array($i) $j] ]
+            
+            set smooth_j [ expr $smooth_j1 + $smooth_j2 ]
+            
+            set smooth [ lappend smooth $smooth_j ] 
+            
+		}
+        set smoothed($i) $smooth
+    }
+    # And add the final point that is also left unchanged
+    # set smoothed([ expr $num_replicas - 1 ]) $drifts_array([expr $num_replicas - 1])
+	return 
+}
+
+proc reparametrize_string { string_array } {
+    
+    global num_images d_alpha_eq normalized_arc_length_eq cv_indexes
+    upvar $string_array reparam 
+    
+    print "STRING METHOD: REPARAMETRIZATION"
+    # Create local copy of the initial array
+    # for future need 
+    
+    foreach key [ array names reparam ] {
+        set copy_my_string($key) $reparam($key)
+    }
+    
+    #  Build normalized arc-length list for the non-reparametrized string
+    
+    set arc_length [ list 0.0 ] 
+    
+    for { set i 1 } { $i < $num_images } { incr i } { 
+        
+        set sum 0.0
+        foreach cv $cv_indexes { 
+            
+            set x [ lindex $copy_my_string($i) $cv ]
+            set x_prev [ lindex $copy_my_string([ expr {$i - 1} ]) $cv ]
+            
+            set dx [ expr {$x - $x_prev}  ]
+            set sum [ expr $sum + [ expr $dx**2 ] ]
+        }
+        set sum [ expr sqrt($sum) ]
+        
+        set sum_prev [ lindex $arc_length [ expr {$i-1} ] ]
+        
+        set sum [ expr {$sum_prev+$sum} ]
+        
+        set arc_length [ lappend arc_length $sum ]
+    }
+    #print $arc_length
+    
+    
+    
+        # Normalize arc length:
+    
+    
+    set total_arc_length [ lindex $arc_length [ expr $num_images - 1 ] ]
+    #print "Total arc length: $total_arc_length"
+    
+    set normalized_arc_length [ list ] 
+    for { set i 0 } { $i < $num_images } { incr i } { 
+        set arc_length_i [ lindex $arc_length $i ]
+        set normalized_arc_length [ lappend normalized_arc_length [ expr $arc_length_i/$total_arc_length ] ]
+    }
+    #print $normalized_arc_length
+        
+   
+    # For each image after equal spacing in alpha:
+    # Find corresponding interpolant segment
+    
+    
+    
+    for { set i 1 } { $i < [ expr $num_images - 1 ] } { incr i } { 
+        
+        set alpha_eq_i [ lindex $normalized_arc_length_eq $i ]
+        #print "STRING REPARAMETRIZATION"
+        print "I=$i, ALPHA_EQ_I = $alpha_eq_i"
+        
+        for { set j 1 } { $j < [ expr $num_images - 1 ] } { incr j } {
+            if { $alpha_eq_i < [ lindex $normalized_arc_length $j ] } {
+                break
+            }
+        }
+        # For each CV build the interpolation CV = f (alpha)
+        
+        set alpha_right [ lindex $normalized_arc_length $j ] 
+        set alpha_left  [ lindex $normalized_arc_length [ expr $j - 1 ] ]
+        set denominator   [ expr {$alpha_right - $alpha_left} ]
+        set delta_alpha_i [ expr {$alpha_eq_i - $alpha_left} ]
+        
+        
+        set new_center_list [ list ]
+        foreach cv $cv_indexes {
+            
+            set left_image  [ lindex $copy_my_string([ expr $j -1 ]) $cv ]
+            set right_image [ lindex $copy_my_string([ expr $j ]) $cv ]
+            
+            set scaling_factor [ expr {$right_image - $left_image} ]
+            set scaling_factor [ expr {$scaling_factor/$denominator} ]
+            
+            
+            set new_center [ expr {$scaling_factor*$delta_alpha_i} ]
+            set new_center [ expr {$left_image + $new_center} ]
+            set new_center [ format "%08.4f" $new_center ]
+            
+            set new_center_list [ lappend new_center_list $new_center ]
+        }
+        
+        set reparam($i) $new_center_list
+    }
+            
+    return         
+    
+
+}
+
+
+
+
+cv config $config3
+
+# Set up main iteration loop
+
+while { $t < $n_iter } {
+
+    set job_output_root [ format $output_root $replica_id $t ]
+    outputname      $job_output_root
+    restartname     $job_output_root-rst
+
+    #dcdfile         $job_output_root.dcd
+
+    run $nsteps
+    
+    replicaBarrier
+    
+    # Gather final CV values, reparametrize the string, compute new centers
+
+    # Store the final values in a list
+    
+    set final_cv_list [ list ]
+    
+    for { set j 0 } { $j < $n_cv } { incr j } {
+
+        set current_cv_name [ lindex $cv_names $j ]
+        set foo [cv colvar $current_cv_name value]
+        set final_cv_list [ lappend final_cv_list [ format "%08.4f" $foo ] ] 
+        
+    }
+
+   
+    # if not master image:
+    if { $replica_id } {
+    
+    
+        # send the list to master process
+        for { set j 0 } { $j < $n_cv } { incr j } {
+        
+            replicaSend [ lindex $final_cv_list $j ] 0
+            
+        }
+        
+    # if master:
+    } else {
+
+        # Add the info for the replica on master process to the array:
+
+        set my_string(0) $final_cv_list
+        #print $my_string(0)
+
+        # loop over the slaves like in my Fortran code
+        # this is inefficient and not suited for production runs
+        
+        for { set rr 1 } { $rr < $num_images } { incr rr } {
+            
+            # append the data sent by the slave to the array
+            
+            set cv_rr [ list ]
+            for { set j 0 } { $j < $n_cv } { incr j } {
+                
+                set foo [ replicaRecv $rr ]
+                set foo [ format "%08.4f" $foo ]
+                set cv_rr [ lappend cv_rr $foo ]
+                
+            }
+        
+            set my_string($rr) $cv_rr
+            #print $my_string($rr)
+            
+        }
+        
+        
+        # Now the master has collected all the data; time to smooth 
+        # then reparam the string
+        
+        smooth_string my_string 
+        reparametrize_string my_string
+        
+        print "STRING METHOD: NEW STRING AFTER REPARAMETRIZATION"
+        for { set g 0 } { $g < $num_images } { incr g } {
+            
+            
+            print $my_string($g)
+        }
+        
+    }
+
+    
+    replicaBarrier
+    
+    set new_cv_list [ list ]
+    
+    if { $replica_id == 0 } {
+        
+        for { set j 0 } { $j < $n_cv } { incr j } {
+        
+            set new_cv_list [ lappend new_cv_list  [ lindex $final_cv_list $j ] ]
+        }
+        
+        
+
+        # Send back the new string to replicas
+        for { set rr 1 } { $rr < $num_images } { incr rr } {
+            
+            
+            for { set j 0 } { $j < $n_cv } { incr j } {
+                
+                set foo [ lindex $my_string($rr) $j ]
+                replicaSend $foo $rr
+            }
+     
+        }
+        
+    } else {
+        
+        for { set j 0 } { $j < $n_cv } { incr j } {
+        
+             set new_cv_list [ lappend new_cv_list [ replicaRecv 0 ] ]
+        }
+    }
+    
+    replicaBarrier
+    
+    # Update bias centers
+    
+    
+    
+    
+    
+    set center_list [ list ]
+    for { set j 0 } { $j < $n_cv } { incr j } {
+        
+        set foo [ lindex $new_cv_list $j ]
+        set foo [ format "%08.4f" $foo ]
+        set center_list [ lappend center_list $foo ]
+    }
+    
+    print "STRING METHOD: UPDATING BIAS TO:"
+    print "STRING METHOD: $center_list"
+    
+    
+    # output string information
+	set output_base [format "./%03d/$prefix.image%03d" $replica_id $replica_id ]
+    set output_master [ format "./string.$prefix.iter%04d.dat" $t ]
+
+
+	if { $write_output } {
+		output $output_base
+
+        
+        set ofile [ open $output_base.log "a" ]
+        
+        puts $ofile [ concat [ list [ format "%04d" $t ] ] $center_list ] 
+	    close $ofile
+        
+        if { $replica_id == 0 } {
+            
+            set ofile [ open $output_master "w" ]
+            
+            for { set l 0 } { $l < $num_replicas } { incr l } { 
+                
+                puts $ofile [ concat [ list [ format "%04d" $t ] ] $my_string($l) ]
+            }
+            close $ofile
+        }
+    }
+    
+    
+    # Update the string bias
+    cv bias string_bias delete
+    set config3 "harmonic {
+    name string_bias
+    colvars $cv_names
+    forceConstant $force_constant
+    centers $center_list
+    
+    }
+    "
+    cv config $config3
+    
+    incr t
+    print "STRING METHOD INFO: Iteration $t done."
+        
+        
+}
+    
+    
+    
